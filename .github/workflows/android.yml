@@ -13,50 +13,88 @@ permissions:
 
 jobs:
   build:
+    name: Build APK
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Locate ZIP
+      - name: Locate ZIP file
         id: zip
         shell: bash
         run: |
           set -euo pipefail
+
           mapfile -d '' archives < <(
             find . -type f -iname '*.zip' \
-              -not -path './.git/*' -print0 | sort -z
+              -not -path './.git/*' \
+              -print0 | sort -z
           )
-          if (( ${#archives[@]} != 1 )); then
-            echo "Expected exactly one ZIP; found ${#archives[@]}."
+
+          if (( ${#archives[@]} == 0 )); then
+            echo "::error::No ZIP file found."
             exit 1
           fi
+
+          if (( ${#archives[@]} > 1 )); then
+            echo "::error::Multiple ZIP files found."
+            printf '%s\n' "${archives[@]}"
+            exit 1
+          fi
+
           echo "path=${archives[0]}" >> "$GITHUB_OUTPUT"
+          echo "ZIP found: ${archives[0]}"
 
       - name: Extract ZIP safely
         env:
           ZIP_PATH: ${{ steps.zip.outputs.path }}
+        shell: bash
         run: |
-          python3 - <<'PY'
-          import os, pathlib, stat, zipfile
+          set -euo pipefail
 
-          source = pathlib.Path(os.environ['ZIP_PATH'])
-          destination = pathlib.Path('extracted').resolve()
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import stat
+          import zipfile
+
+          source = pathlib.Path(os.environ["ZIP_PATH"])
+          destination = pathlib.Path("extracted").resolve()
           destination.mkdir(exist_ok=True)
 
-          with zipfile.ZipFile(source) as z:
-              for info in z.infolist():
-                  path = pathlib.PurePosixPath(info.filename)
-                  if path.is_absolute() or '..' in path.parts or '\\' in info.filename:
-                      raise ValueError(f'Unsafe path: {info.filename}')
-                  if (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK:
-                      raise ValueError(f'Symlink not allowed: {info.filename}')
-                  target = (destination / info.filename).resolve()
+          with zipfile.ZipFile(source) as archive:
+              for item in archive.infolist():
+                  name = item.filename
+                  path = pathlib.PurePosixPath(name)
+
+                  if (
+                      path.is_absolute()
+                      or ".." in path.parts
+                      or "\\" in name
+                  ):
+                      raise ValueError(
+                          f"Unsafe ZIP path: {name}"
+                      )
+
+                  mode = item.external_attr >> 16
+
+                  if stat.S_ISLNK(mode):
+                      raise ValueError(
+                          f"Symlink not allowed: {name}"
+                      )
+
+                  target = (destination / name).resolve()
+
                   if not target.is_relative_to(destination):
-                      raise ValueError(f'Unsafe path: {info.filename}')
-              z.extractall(destination)
+                      raise ValueError(
+                          f"Path escapes extraction directory: {name}"
+                      )
+
+              archive.extractall(destination)
+
+          print("ZIP extracted successfully.")
           PY
 
       - name: Find Android project
@@ -64,19 +102,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           mapfile -d '' projects < <(
             find extracted -type f \
-              \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
+              \( -name 'settings.gradle' \
+              -o -name 'settings.gradle.kts' \) \
               -print0
           )
+
           if (( ${#projects[@]} != 1 )); then
-            echo "Expected exactly one Android Gradle project; found ${#projects[@]}."
+            echo "::error::Expected one Gradle project, found ${#projects[@]}."
             exit 1
           fi
-          project_dir="$(dirname "${projects[0]}")"
-          echo "dir=$project_dir" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Java
+          project_dir="$(dirname "${projects[0]}")"
+
+          echo "dir=$project_dir" >> "$GITHUB_OUTPUT"
+          echo "Android project: $project_dir"
+
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -84,27 +128,87 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+
+      - name: Verify Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          sdkmanager --list_installed
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build debug APK
+      - name: Build Debug APK
         shell: bash
         env:
           PROJECT_DIR: ${{ steps.project.outputs.dir }}
         run: |
           set -euo pipefail
+
           cd "$PROJECT_DIR"
+
           if [[ -f gradlew ]]; then
             chmod +x gradlew
-            ./gradlew assembleDebug --no-daemon
+            ./gradlew assembleDebug \
+              --no-daemon \
+              --stacktrace
           else
-            gradle assembleDebug --no-daemon
+            echo "Gradle wrapper not found."
+            echo "Using installed Gradle."
+            gradle assembleDebug \
+              --no-daemon \
+              --stacktrace
           fi
 
-      - name: Upload APK artifact
+      - name: Find generated APK
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p apk-output
+
+          mapfile -d '' apks < <(
+            find extracted -type f \
+              -path '*/build/outputs/apk/*' \
+              -name '*.apk' \
+              -print0
+          )
+
+          if (( ${#apks[@]} == 0 )); then
+            echo "::error::No APK generated."
+            exit 1
+          fi
+
+          index=1
+
+          for apk in "${apks[@]}"; do
+            cp "$apk" \
+              "apk-output/app-${index}.apk"
+            index=$((index + 1))
+          done
+
+          ls -lh apk-output/
+
+      - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: android-debug-apk
-          path: extracted/**/build/outputs/apk/**/*.apk
+          name: Android-APK
+          path: apk-output/*.apk
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Build-Diagnostics
+          path: |
+            extracted/**/build/reports/**
+            extracted/**/build/outputs/logs/**
+          if-no-files-found: ignore
+          retention-days: 7
