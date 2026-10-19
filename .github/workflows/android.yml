@@ -2,11 +2,10 @@
 name: Build Android APK from ZIP
 
 on:
-  workflow_dispatch:
   push:
-    paths:
-      - '**/*.zip'
-      - '.github/workflows/build-apk.yml'
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
