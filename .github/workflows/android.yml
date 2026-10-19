@@ -1,310 +1,110 @@
 
-name: OverLoad ZIP to APK
+name: Build Android APK from ZIP
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
     paths:
-      - "OverLoad-Android.zip"
-      - ".github/workflows/android.yml"
+      - '**/*.zip'
+      - '.github/workflows/build-apk.yml'
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Java 17
+      - name: Locate ZIP
+        id: zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' archives < <(
+            find . -type f -iname '*.zip' \
+              -not -path './.git/*' -print0 | sort -z
+          )
+          if (( ${#archives[@]} != 1 )); then
+            echo "Expected exactly one ZIP; found ${#archives[@]}."
+            exit 1
+          fi
+          echo "path=${archives[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract ZIP safely
+        env:
+          ZIP_PATH: ${{ steps.zip.outputs.path }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, stat, zipfile
+
+          source = pathlib.Path(os.environ['ZIP_PATH'])
+          destination = pathlib.Path('extracted').resolve()
+          destination.mkdir(exist_ok=True)
+
+          with zipfile.ZipFile(source) as z:
+              for info in z.infolist():
+                  path = pathlib.PurePosixPath(info.filename)
+                  if path.is_absolute() or '..' in path.parts or '\\' in info.filename:
+                      raise ValueError(f'Unsafe path: {info.filename}')
+                  if (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK:
+                      raise ValueError(f'Symlink not allowed: {info.filename}')
+                  target = (destination / info.filename).resolve()
+                  if not target.is_relative_to(destination):
+                      raise ValueError(f'Unsafe path: {info.filename}')
+              z.extractall(destination)
+          PY
+
+      - name: Find Android project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' projects < <(
+            find extracted -type f \
+              \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
+              -print0
+          )
+          if (( ${#projects[@]} != 1 )); then
+            echo "Expected exactly one Android Gradle project; found ${#projects[@]}."
+            exit 1
+          fi
+          project_dir="$(dirname "${projects[0]}")"
+          echo "dir=$project_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
-      - name: Setup Android SDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
-
-      - name: Locate and extract ZIP
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import zipfile
-          from pathlib import Path
-          from stat import S_IFMT, S_IFLNK
-
-          candidates = [
-              Path("OverLoad-Android.zip"),
-              Path("OverLoad-Language-Infinite-WebApp.zip")
-          ]
-          zip_path = next(
-              (p for p in candidates if p.is_file()), None
-          )
-          if zip_path is None:
-              raise SystemExit(
-                  "ZIP missing. Upload OverLoad-Android.zip "
-                  "to the repository root."
-              )
-
-          target = Path("extracted").resolve()
-          target.mkdir(exist_ok=True)
-
-          with zipfile.ZipFile(zip_path) as archive:
-              for item in archive.infolist():
-                  p = Path(item.filename)
-                  mode = item.external_attr >> 16
-                  if (
-                      p.is_absolute()
-                      or ".." in p.parts
-                      or S_IFMT(mode) == S_IFLNK
-                  ):
-                      raise ValueError(
-                          f"Unsafe ZIP entry: {item.filename}"
-                      )
-              archive.extractall(target)
-
-          print(f"Extracted {zip_path}")
-          PY
-
-      - name: Create Android WebView project
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-          import shutil
-          import textwrap
-
-          root = Path("extracted")
-          html_files = list(root.rglob("index.html"))
-
-          if not html_files:
-              raise SystemExit(
-                  "index.html not found inside ZIP."
-              )
-
-          web_root = min(
-              (p.parent for p in html_files),
-              key=lambda p: len(p.parts)
-          )
-
-          project = Path("android-project")
-          assets = project / "app/src/main/assets"
-          java = (
-              project /
-              "app/src/main/java/com/overload/language"
-          )
-
-          assets.mkdir(parents=True, exist_ok=True)
-          java.mkdir(parents=True, exist_ok=True)
-
-          for item in web_root.iterdir():
-              dest = assets / item.name
-              if item.is_dir():
-                  shutil.copytree(
-                      item, dest, dirs_exist_ok=True
-                  )
-              elif item.is_file():
-                  shutil.copy2(item, dest)
-
-          (project / "settings.gradle").write_text(
-              textwrap.dedent("""
-              pluginManagement {
-                  repositories {
-                      google()
-                      mavenCentral()
-                      gradlePluginPortal()
-                  }
-              }
-              dependencyResolutionManagement {
-                  repositoriesMode.set(
-                      RepositoriesMode.FAIL_ON_PROJECT_REPOS
-                  )
-                  repositories {
-                      google()
-                      mavenCentral()
-                  }
-              }
-              rootProject.name = 'OverLoadLanguage'
-              include ':app'
-              """).strip() + "\n"
-          )
-
-          (project / "build.gradle").write_text(
-              "plugins {\n"
-              "    id 'com.android.application' "
-              "version '8.7.3' apply false\n"
-              "}\n"
-          )
-
-          (project / "gradle.properties").write_text(
-              "org.gradle.jvmargs=-Xmx2048m "
-              "-Dfile.encoding=UTF-8\n"
-              "android.useAndroidX=true\n"
-          )
-
-          (project / "app/build.gradle").write_text(
-              textwrap.dedent("""
-              plugins {
-                  id 'com.android.application'
-              }
-
-              android {
-                  namespace 'com.overload.language'
-                  compileSdk 35
-
-                  defaultConfig {
-                      applicationId 'com.overload.language'
-                      minSdk 26
-                      targetSdk 28
-                      versionCode 2
-                      versionName '2.0.0'
-                  }
-              }
-              """).strip() + "\n"
-          )
-
-          manifest = (
-              project /
-              "app/src/main/AndroidManifest.xml"
-          )
-          manifest.parent.mkdir(
-              parents=True, exist_ok=True
-          )
-          manifest.write_text(
-              textwrap.dedent("""
-              <?xml version="1.0" encoding="utf-8"?>
-              <manifest xmlns:android=
-                  "http://schemas.android.com/apk/res/android">
-                  <uses-permission android:name=
-                      "android.permission.INTERNET" />
-                  <application
-                      android:label="OverLoad Language"
-                      android:theme=
-                          "@android:style/Theme.Material.Light.NoActionBar"
-                      android:usesCleartextTraffic="false">
-                      <activity
-                          android:name=".MainActivity"
-                          android:exported="true">
-                          <intent-filter>
-                              <action android:name=
-                                  "android.intent.action.MAIN" />
-                              <category android:name=
-                                  "android.intent.category.LAUNCHER" />
-                          </intent-filter>
-                      </activity>
-                  </application>
-              </manifest>
-              """).strip() + "\n"
-          )
-
-          activity = java / "MainActivity.java"
-          activity.write_text(
-              textwrap.dedent("""
-              package com.overload.language;
-
-              import android.app.Activity;
-              import android.os.Bundle;
-              import android.webkit.WebView;
-              import android.webkit.WebViewClient;
-              import android.webkit.WebChromeClient;
-              import android.webkit.WebSettings;
-
-              public class MainActivity extends Activity {
-                  private WebView webView;
-
-                  @Override
-                  public void onCreate(Bundle state) {
-                      super.onCreate(state);
-
-                      webView = new WebView(this);
-                      setContentView(webView);
-
-                      WebSettings settings =
-                          webView.getSettings();
-                      settings.setJavaScriptEnabled(true);
-                      settings.setDomStorageEnabled(true);
-                      settings.setAllowFileAccess(true);
-                      settings.setMediaPlaybackRequiresUserGesture(
-                          false
-                      );
-
-                      webView.setWebViewClient(
-                          new WebViewClient()
-                      );
-                      webView.setWebChromeClient(
-                          new WebChromeClient()
-                      );
-
-                      webView.loadUrl(
-                          "file:///android_asset/index.html"
-                      );
-                  }
-
-                  @Override
-                  protected void onDestroy() {
-                      if (webView != null) {
-                          webView.destroy();
-                      }
-                      super.onDestroy();
-                  }
-              }
-              """).strip() + "\n"
-          )
-
-          print("Android WebView project created.")
-          print("Web root:", web_root)
-          PY
-
-      - name: Setup Gradle
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.10.2"
 
-      - name: Build Debug APK
+      - name: Build debug APK
         shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
         run: |
           set -euo pipefail
-          cd android-project
-          gradle assembleDebug --no-daemon --stacktrace
+          cd "$PROJECT_DIR"
+          if [[ -f gradlew ]]; then
+            chmod +x gradlew
+            ./gradlew assembleDebug --no-daemon
+          else
+            gradle assembleDebug --no-daemon
+          fi
 
-      - name: Collect APK
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p output
-          cp android-project/app/build/outputs/apk/debug/*.apk \
-            output/OverLoad-Language.apk
-          ls -lh output/
-
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OverLoad-Language-APK
-          path: output/OverLoad-Language.apk
+          name: android-debug-apk
+          path: extracted/**/build/outputs/apk/**/*.apk
           if-no-files-found: error
-          retention-days: 30
-
-      - name: Build Summary
-        if: success()
-        shell: bash
-        run: |
-          echo "## OverLoad Language APK Build Success" \
-            >> "$GITHUB_STEP_SUMMARY"
-          echo "Download the APK from Actions Artifacts." \
-            >> "$GITHUB_STEP_SUMMARY"
